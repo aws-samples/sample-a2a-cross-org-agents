@@ -1,0 +1,211 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  A2A Composable Demo - enterprise ECS services (stack a2a-enterprise-services).
+  Deploy AFTER CodeBuild has pushed the images and the partner API's anonymous-denial
+  check has passed. Imports the identity stack (callback URL, orchestrator secret ARN)
+  and the infra stack (network, roles, and the SaaS provider's public token endpoint
+  and callback scope from the onboarding response).
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Side prefix for the enterprise account
+    Default: a2a-enterprise
+    AllowedValues: [a2a-enterprise]
+  InfraStackName:
+    Type: String
+    Description: Name of the infrastructure stack
+    Default: a2a-enterprise-infra
+  IdentityStackName:
+    Type: String
+    Description: Name of the enterprise identity stack (notebook 1)
+    Default: a2a-enterprise-identity
+  SaasAgentCardUrl:
+    Type: String
+    Description: The SaaS provider's Agent Card URL (from the onboarding response). Used for Agent Card discovery.
+    # https only, an AgentCore runtime card URL in a supported Region, ending with
+    # the A2A card path. The runtime segment has no slash, query, fragment,
+    # whitespace, quote, or backslash, which keeps the AGENT_CARD_URLS JSON value valid.
+    AllowedPattern: '^https://bedrock-agentcore\.(us-east-1|us-east-2|us-west-2)\.amazonaws\.com/runtimes/[^/?#\s"\\]+/invocations/\.well-known/agent-card\.json$'
+
+Resources:
+
+  # trivy:ignore:AVD-AWS-0035 -- the tmp volume is a bind mount on the task's ephemeral storage, not EFS, so nothing crosses the network
+  ContextAgentTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${NamePrefix}-context-agent'
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${InfraStackName}-ExecutionRoleArn'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${InfraStackName}-ContextAgentTaskRoleArn'
+      # The task's only writable path: a bind mount on its ephemeral storage, at /tmp in the container.
+      Volumes:
+        - Name: tmp
+      ContainerDefinitions:
+        - Name: context-agent
+          Image: !Sub
+            - '${RepoUri}:latest'
+            - RepoUri: !ImportValue
+                Fn::Sub: '${InfraStackName}-ContextAgentRepoUri'
+          PortMappings:
+            - ContainerPort: 9001
+          Environment:
+            # Self-describing A2A card: advertise the partner API URL reserved by the
+            # identity stack (notebook 1). The SaaS provider registered this URL at onboarding.
+            - Name: CONTEXT_AGENT_URL
+              Value: !ImportValue
+                Fn::Sub: '${IdentityStackName}-CallbackURL'   # already ends with "/"
+            # Non-secret values for the card's OAuth2 client-credentials securityScheme:
+            # the SaaS provider's token endpoint and callback scope (from the onboarding response).
+            - Name: CARD_AUTH_URL
+              Value: !ImportValue
+                Fn::Sub: '${InfraStackName}-SaasTokenEndpoint'
+            - Name: CARD_AUTH_SCOPE
+              Value: !ImportValue
+                Fn::Sub: '${InfraStackName}-SaasCallbackScope'
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            # This account's Amazon Bedrock guardrail and its numbered version (the infrastructure stack)
+            - Name: GUARDRAIL_ID
+              Value: !ImportValue
+                Fn::Sub: '${InfraStackName}-GuardrailId'
+            - Name: GUARDRAIL_VERSION
+              Value: !ImportValue
+                Fn::Sub: '${InfraStackName}-GuardrailVersion'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${InfraStackName}-ContextAgentLogsGroup'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: context
+          # Read-only root file system and no Linux capabilities; the app writes only to /tmp.
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            Capabilities:
+              Drop: [ALL]
+          MountPoints:
+            - SourceVolume: tmp
+              ContainerPath: /tmp
+              ReadOnly: false
+
+  # trivy:ignore:AVD-AWS-0035 -- the tmp volume is a bind mount on the task's ephemeral storage, not EFS, so nothing crosses the network
+  OrchestratorTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${NamePrefix}-orchestrator'
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${InfraStackName}-ExecutionRoleArn'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${InfraStackName}-OrchestratorTaskRoleArn'
+      # The task's only writable path: a bind mount on its ephemeral storage, at /tmp in the container.
+      Volumes:
+        - Name: tmp
+      ContainerDefinitions:
+        # trivy:ignore:AVD-AWS-0036 -- holds the Secrets Manager secret ARN, not the secret value
+        - Name: orchestrator
+          Image: !Sub
+            - '${RepoUri}:latest'
+            - RepoUri: !ImportValue
+                Fn::Sub: '${InfraStackName}-OrchestratorRepoUri'
+          PortMappings:
+            - ContainerPort: 8000
+          Environment:
+            - Name: AGENT_CARD_URLS
+              Value: !Sub '["${SaasAgentCardUrl}"]'
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: COGNITO_SECRET_ARN
+              Value: !ImportValue
+                Fn::Sub: '${IdentityStackName}-OrchestratorSecretArn'
+            # This account's Amazon Bedrock guardrail and its numbered version (the infrastructure stack)
+            - Name: GUARDRAIL_ID
+              Value: !ImportValue
+                Fn::Sub: '${InfraStackName}-GuardrailId'
+            - Name: GUARDRAIL_VERSION
+              Value: !ImportValue
+                Fn::Sub: '${InfraStackName}-GuardrailVersion'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${InfraStackName}-OrchestratorLogsGroup'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: orchestrator
+          # Read-only root file system and no Linux capabilities; the app writes only to /tmp.
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            Capabilities:
+              Drop: [ALL]
+          MountPoints:
+            - SourceVolume: tmp
+              ContainerPath: /tmp
+              ReadOnly: false
+
+  ContextAgentService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !ImportValue
+        Fn::Sub: '${InfraStackName}-ECSClusterName'
+      ServiceName: context-agent
+      TaskDefinition: !Ref ContextAgentTask
+      DesiredCount: 1
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: '${InfraStackName}-PrivateSubnet1Id'
+            - !ImportValue
+              Fn::Sub: '${InfraStackName}-PrivateSubnet2Id'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${InfraStackName}-ContextAgentSecurityGroupId'
+      LoadBalancers:
+        - ContainerName: context-agent
+          ContainerPort: 9001
+          TargetGroupArn: !ImportValue
+            Fn::Sub: '${InfraStackName}-ContextAgentTargetGroupArn'
+
+  # DesiredCount stays 1: the orchestrator keeps jobs in memory (single-task
+  # assumption). Running more than one task needs a shared job store such as DynamoDB.
+  OrchestratorService:
+    Type: AWS::ECS::Service
+    DependsOn: [ContextAgentService]
+    Properties:
+      Cluster: !ImportValue
+        Fn::Sub: '${InfraStackName}-ECSClusterName'
+      ServiceName: orchestrator
+      TaskDefinition: !Ref OrchestratorTask
+      DesiredCount: 1
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: '${InfraStackName}-PrivateSubnet1Id'
+            - !ImportValue
+              Fn::Sub: '${InfraStackName}-PrivateSubnet2Id'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${InfraStackName}-OrchestratorSecurityGroupId'
+      LoadBalancers:
+        - ContainerName: orchestrator
+          ContainerPort: 8000
+          TargetGroupArn: !ImportValue
+            Fn::Sub: '${InfraStackName}-OrchestratorTargetGroupArn'

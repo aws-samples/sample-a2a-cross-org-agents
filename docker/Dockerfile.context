@@ -1,0 +1,27 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+# python:3.12-slim pinned by its multi-arch index digest (2026-10-29); to bump, use the top-level Digest from: docker buildx imagetools inspect public.ecr.aws/docker/library/python:3.12-slim
+FROM public.ecr.aws/docker/library/python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
+WORKDIR /app
+# Apply available OS security updates
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/*
+COPY requirements-enterprise.txt requirements.txt
+# Install dependencies, then remove pip and setuptools: nothing installs packages at runtime
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -m pip uninstall -y pip setuptools wheel \
+    && rm -rf /usr/local/lib/python3*/ensurepip/_bundled
+# Run as an unprivileged user (the app only listens on ports above 1024 and writes nothing to disk)
+RUN useradd --create-home --uid 10001 appuser
+# With the task's root file system read-only, /tmp is the only writable path. A VOLUME keeps the image's /tmp
+# mode (1777) on the task's bind mount, so the unprivileged user can write there.
+VOLUME ["/tmp"]
+COPY enterprise_context_agent.py .
+# The code binds to loopback by default. In the container it listens on all of the
+# task's interfaces so the internal NLB can reach it; the task security group
+# admits port 9001 only from the NLB's security group, and no port is published.
+ENV BIND_HOST=0.0.0.0
+EXPOSE 9001
+USER appuser
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/.well-known/agent-card.json', timeout=4)" || exit 1
+CMD ["python", "enterprise_context_agent.py"]

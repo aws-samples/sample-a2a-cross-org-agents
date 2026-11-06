@@ -1,0 +1,35 @@
+Third-party software in this sample, and its licenses. Generated from the installed packages'
+metadata (License-Expression, then License, then the license classifier).
+
+Packages in the agent images (exact pins in requirements/):
+
+** strands-agents; version ==1.62.0 (SaaS agent) -- https://github.com/strands-agents/harness-sdk -- Apache-2.0
+** langchain; version ==1.4.7 (enterprise agents) -- https://github.com/langchain-ai/langchain -- MIT
+** langchain-aws; version ==1.9.1 (enterprise agents) -- https://github.com/langchain-ai/langchain-aws -- MIT
+** langchain-core; version ==1.7.0 (enterprise agents) -- https://github.com/langchain-ai/langchain -- MIT
+** langgraph; version ==1.2.18 (enterprise agents) -- https://github.com/langchain-ai/langgraph -- MIT
+** langgraph-checkpoint; version ==4.3.1 (enterprise agents) -- https://github.com/langchain-ai/langgraph -- MIT
+** langgraph-sdk; version ==0.4.10 (enterprise agents) -- https://github.com/langchain-ai/langgraph -- MIT
+** a2a-sdk; version ==1.2.2 (enterprise agents), ==0.3.26 (SaaS agent) -- https://github.com/a2aproject/a2a-python -- Apache-2.0
+** fastapi; version ==0.162.0 (enterprise agents and SaaS agent) -- https://github.com/fastapi/fastapi -- MIT
+** starlette; version ==1.10.0 (enterprise agents and SaaS agent) -- https://github.com/Kludex/starlette -- BSD-3-Clause
+** pydantic; version ==2.14.1 (enterprise agents) -- https://github.com/pydantic/pydantic -- MIT
+** uvicorn; version ==0.54.0 (enterprise agents and SaaS agent) -- https://github.com/Kludex/uvicorn -- BSD-3-Clause
+** httpx; version ==0.28.1 (enterprise agents and SaaS agent) -- https://github.com/encode/httpx -- BSD-3-Clause
+** boto3; version ==1.43.119 (enterprise agents and SaaS agent) -- https://github.com/boto/boto3 -- Apache-2.0
+** botocore; version ==1.43.119 (enterprise agents and SaaS agent) -- https://github.com/boto/botocore -- Apache-2.0
+** msgpack; version ==1.2.4 (enterprise agents) -- https://github.com/msgpack/msgpack-python -- Apache-2.0
+** urllib3; version ==2.8.0 (enterprise agents) -- https://github.com/urllib3/urllib3 -- MIT
+** mcp; version ==1.30.0 (SaaS agent) -- https://github.com/modelcontextprotocol/python-sdk -- MIT
+
+Packages the notebooks install (%pip; the specifier as written, and the version it resolved to
+when this file was generated):
+
+** boto3; specifier >=1.42.1,<2.0.0 (all three notebooks), resolved 1.43.119 -- https://github.com/boto/boto3 -- Apache-2.0
+** requests; specifier >=2.31.0,<3.0.0 (all three notebooks), resolved 2.34.2 -- https://github.com/psf/requests -- Apache-2.0
+** python-dotenv; specifier >=1.0,<2.0 (all three notebooks), resolved 1.2.4 -- https://github.com/theskumar/python-dotenv -- BSD-3-Clause
+** pyyaml; specifier >=6.0,<7.0 (notebook 2), resolved 6.0.3 -- https://github.com/yaml/pyyaml -- MIT
+** bedrock-agentcore; specifier >=0.1.0,<1.0.0 (notebook 2), resolved 0.1.7 -- https://github.com/aws/bedrock-agentcore-sdk-python -- Apache-2.0
+** bedrock-agentcore-starter-toolkit; specifier ==0.1.25 (notebook 2), resolved 0.1.25 -- https://github.com/aws/bedrock-agentcore-starter-toolkit -- Apache-2.0
+
+See each package's repository for the full license text.

@@ -1,0 +1,23 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Exact pins, resolved 2026-10-27 for Python 3.12. Re-resolve and re-test before
+# changing any of them. Used by both enterprise agents (context agent and orchestrator).
+# langchain provides create_agent, which builds both enterprise agents.
+langchain==1.4.7
+langchain-aws==1.9.1
+langchain-core==1.7.0
+langgraph==1.2.18
+langgraph-checkpoint==4.3.1
+langgraph-sdk==0.4.10
+# a2a-sdk 1.2.2 serves the context agent in A2A v0.3 compatibility mode.
+a2a-sdk[http-server]==1.2.2
+fastapi==0.162.0
+starlette==1.10.0
+pydantic==2.14.1
+uvicorn==0.54.0
+httpx==0.28.1
+boto3==1.43.119
+botocore==1.43.119
+msgpack==1.2.4
+urllib3==2.8.0

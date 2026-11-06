@@ -1,0 +1,275 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  A2A Composable Demo - SaaS provider runtime prerequisites (stack a2a-saas-runtime).
+  ECR repository for the compliance agent image, an empty secret for the SaaS
+  callback client's own credentials (readable only by the runtime role), a
+  least-privilege AgentCore execution role, and a least-privilege CodeBuild role
+  for the image build. The notebook passes the roles with --execution-role and
+  --code-build-execution-role, and the repository with --ecr.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Side prefix for the SaaS provider account
+    Default: a2a-saas
+    AllowedValues: [a2a-saas]
+  AgentName:
+    Type: String
+    Description: AgentCore runtime name (scopes the runtime log-group permissions)
+    Default: a2a_saas_compliance_agent
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,47}$'
+
+Resources:
+
+  # -- ECR --
+  # The toolkit pushes to this repository (agentcore configure --ecr) instead of
+  # creating its own, so the image gets scan on push and the role an exact ARN.
+  # EmptyOnDelete removes the images when the stack is deleted.
+  # trivy:ignore:AVD-AWS-0033 -- AES-256 service-default encryption; use a customer managed KMS key in production
+  # trivy:ignore:AVD-AWS-0031 -- mutable tags: the toolkit re-pushes :latest on each launch
+  ComplianceAgentRepo:
+    Type: AWS::ECR::Repository
+    # checkov:skip=CKV_AWS_136:Encrypted at rest with AES-256 (service default). Use a customer managed KMS key in production.
+    # checkov:skip=CKV_AWS_51:The AgentCore starter toolkit pushes :latest on every launch; immutable tags would fail re-runs. Scan on push is enabled.
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}-compliance-agent'
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # -- Secrets Manager --
+  # Created EMPTY (no SecretString): notebook 2 writes the callback client's
+  # credentials (from stack a2a-saas-identity) with put_secret_value, so a stack
+  # update can never overwrite a real value and no secret transits a template
+  # parameter or output. Only SaasAgentRuntimeRole is granted read access, and
+  # CallbackSecretPolicy denies every other principal.
+  # trivy:ignore:AVD-AWS-0098 -- Secrets Manager AWS managed key; use a customer managed KMS key in production
+  CallbackCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    # checkov:skip=CKV_AWS_149:Demo uses the Secrets Manager AWS managed key. Use a customer managed KMS key in production (README, Security).
+    Properties:
+      Name: !Sub '${NamePrefix}/callback-credentials'
+      Description: The SaaS callback client's own credentials (written by the notebook)
+
+  # One reader, enforced on the secret itself: deny GetSecretValue to every
+  # principal except the runtime role. Guards against accidental and over-broad
+  # identity policies; an account administrator can still remove the policy.
+  CallbackSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref CallbackCredentialsSecret
+      BlockPublicPolicy: true
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: OnlyTheRuntimeRoleReads
+            Effect: Deny
+            Principal: '*'
+            Action: secretsmanager:GetSecretValue
+            Resource: '*'
+            Condition:
+              ArnNotEquals:
+                aws:PrincipalArn: !GetAtt SaasAgentRuntimeRole.Arn
+
+  # -- CodeBuild role for the image build --
+  # Least-privilege replacement for the role the starter toolkit creates by default
+  # (AmazonBedrockAgentCoreSDKCodeBuild-<Region>-<hash>), which can read, write, and list
+  # every agent's sources in the toolkit's bucket and write to every bedrock-agentcore build
+  # log group. The notebook passes this role with agentcore configure
+  # --code-build-execution-role, so the toolkit creates none. The trust policy accepts only
+  # this agent's toolkit CodeBuild project, bedrock-agentcore-<AgentName>-builder, in this
+  # account and Region. The toolkit lowercases the agent name in the project name, so this
+  # condition and the build log-group ARNs below match only a lowercase AgentName; the
+  # default and the notebook's name are lowercase.
+  ToolkitCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/bedrock-agentcore-${AgentName}-builder'
+      Policies:
+        - PolicyName: ToolkitCodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ecr:GetAuthorizationToken does not support resource-level permissions (must be '*')
+              - Sid: EcrAuthToken
+                Effect: Allow
+                Action: [ecr:GetAuthorizationToken]
+                Resource: '*'
+              # The seven ECR actions the toolkit's default role grants, on this one repository
+              - Sid: EcrPushImage
+                Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:PutImage, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload]
+                Resource: !GetAtt ComplianceAgentRepo.Arn
+              # CodeBuild creates the project's log group at runtime
+              - Sid: BuildLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/bedrock-agentcore-${AgentName}-builder'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/bedrock-agentcore-${AgentName}-builder:*'
+              # Read only this agent's source archive, the same two S3 actions the enterprise build role
+              # has. The toolkit uploads it with the deployer's credentials, so the build never writes
+              # or lists. s3:ResourceAccount refuses a bucket with this name in another account.
+              - Sid: ReadAgentSource
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::bedrock-agentcore-codebuild-sources-${AWS::AccountId}-${AWS::Region}/${AgentName}/source.zip'
+                Condition:
+                  StringEquals:
+                    s3:ResourceAccount: !Ref AWS::AccountId
+
+  # -- AgentCore execution role --
+  # Least-privilege replacement for the starter toolkit's default role. The trust
+  # policy carries confused-deputy conditions: only AgentCore resources in this
+  # account and Region can assume it.
+  SaasAgentRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*'
+      Policies:
+        - PolicyName: SaasAgentRuntimePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrPullImage
+                Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !GetAtt ComplianceAgentRepo.Arn
+              # ecr:GetAuthorizationToken does not support resource-level permissions (must be '*')
+              - Sid: EcrAuthToken
+                Effect: Allow
+                Action: [ecr:GetAuthorizationToken]
+                Resource: '*'
+              - Sid: RuntimeLogGroups
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:DescribeLogStreams]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${AgentName}-*'
+              - Sid: RuntimeLogStreams
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${AgentName}-*:log-stream:*'
+              - Sid: DescribeLogGroups
+                Effect: Allow
+                Action: [logs:DescribeLogGroups]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              # X-Ray write actions do not support resource-level permissions (must be '*').
+              # Kept from the AWS-documented AgentCore runtime baseline.
+              - Sid: XRayWrite
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets]
+                Resource: '*'
+              # cloudwatch:PutMetricData does not support resource-level permissions (must be '*');
+              # the namespace condition limits it to AgentCore metrics (AWS-documented baseline).
+              - Sid: RuntimeMetrics
+                Effect: Allow
+                Action: [cloudwatch:PutMetricData]
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              # The model ID is a "us." cross-Region inference profile. The profile ARN is exact
+              # (this Region and account). Bedrock may route the request to another US Region, so
+              # the foundation-model ARN wildcards only the Region segment; the model ID is exact.
+              - Sid: BedrockInvokeClaude
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-sonnet-4-6'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6'
+              - Sid: ReadCallbackCredentials
+                Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref CallbackCredentialsSecret
+              # Needed with a guardrail on each model call, and for the agent's own ApplyGuardrail checks
+              - Sid: ApplyGuardrail
+                Effect: Allow
+                Action: [bedrock:ApplyGuardrail]
+                Resource: !GetAtt Guardrail.GuardrailArn
+
+  # -- Amazon Bedrock Guardrails --
+  # Prompt-attack and harmful-content filters only. No sensitive-information, word, topic, or grounding
+  # policy: a sensitive-information filter could mask the escalation contacts the agents pass on. Classic tier and the AWS
+  # managed key; README, Production considerations, has the Standard tier and a customer managed key.
+  Guardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub '${NamePrefix}-guardrail'
+      Description: Prompt-attack and harmful-content filters for the A2A demo agents; no sensitive-information filters
+      BlockedInputMessaging: "The compliance agent's Amazon Bedrock guardrail blocked this request."
+      BlockedOutputsMessaging: "The compliance agent's Amazon Bedrock guardrail blocked this response."
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: PROMPT_ATTACK
+            InputStrength: HIGH
+            OutputStrength: NONE
+          - Type: HATE
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: INSULTS
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: SEXUAL
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: VIOLENCE
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: MISCONDUCT
+            InputStrength: LOW
+            OutputStrength: LOW
+  # A numbered version for the agents (never DRAFT). A Description change forces a new version.
+  GuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt Guardrail.GuardrailId
+      Description: 'Prompt attack HIGH on input; hate, insults, sexual, violence MEDIUM; misconduct LOW'
+
+Outputs:
+  RuntimeRoleArn:
+    Description: Pass to agentcore configure --execution-role
+    Value: !GetAtt SaasAgentRuntimeRole.Arn
+  RepositoryUri:
+    Description: Pass to agentcore configure --ecr
+    Value: !GetAtt ComplianceAgentRepo.RepositoryUri
+  CodeBuildRoleArn:
+    Description: Pass to agentcore configure --code-build-execution-role
+    Value: !GetAtt ToolkitCodeBuildRole.Arn
+  CallbackSecretArn:
+    Description: ARN only (no value); set as CALLBACK_SECRET_ARN with agentcore launch --env
+    Value: !Ref CallbackCredentialsSecret
+  AgentName:
+    Value: !Ref AgentName
+  GuardrailId:
+    Description: The compliance agent's Amazon Bedrock guardrail ID (pass it with agentcore launch --env GUARDRAIL_ID)
+    Value: !GetAtt Guardrail.GuardrailId
+  GuardrailVersion:
+    Description: The guardrail's numbered version (pass it with agentcore launch --env GUARDRAIL_VERSION)
+    Value: !GetAtt GuardrailVersion.Version
+  GuardrailArn:
+    Description: The guardrail's ARN without a version, the scope of the runtime role's bedrock:ApplyGuardrail
+    Value: !GetAtt Guardrail.GuardrailArn

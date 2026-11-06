@@ -1,0 +1,23 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+version: 0.2
+
+# CONTEXT_REPO_URI and ORCHESTRATOR_REPO_URI are set on the CodeBuild project by
+# the infra stack (the stack-owned ECR repositories).
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+  build:
+    commands:
+      - echo Building Enterprise Context Agent image...
+      - docker build -f Dockerfile.context -t $CONTEXT_REPO_URI:latest .
+      - echo Building Enterprise Orchestrator image...
+      - docker build -f Dockerfile.orchestrator -t $ORCHESTRATOR_REPO_URI:latest .
+  post_build:
+    commands:
+      - echo Pushing images to ECR...
+      - docker push $CONTEXT_REPO_URI:latest
+      - docker push $ORCHESTRATOR_REPO_URI:latest
+      - echo Build completed

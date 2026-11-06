@@ -1,0 +1,106 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  A2A Composable Demo - SaaS provider identity (stack a2a-saas-identity, notebook 2).
+  The SaaS user pool issues tokens only to the SaaS agent's own callback client,
+  which calls the customer's context agent. The enterprise partner API trusts this
+  pool, client, and scope. Notebook 2 writes the client's credentials to the
+  runtime stack's secret in-process.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Side prefix for the SaaS provider account
+    Default: a2a-saas
+    AllowedValues: [a2a-saas]
+  ResourceServerId:
+    Type: String
+    Description: Resource server identifier for the customer callback
+    Default: a2a-saas-customer-callback
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+  ScopeName:
+    Type: String
+    Description: Custom scope name on the resource server
+    Default: invoke
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+  ClientName:
+    Type: String
+    Description: App client the SaaS agent uses for the customer callback
+    Default: a2a-saas-callback-client
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${NamePrefix}-pool'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      # The pool has no users (machine-to-machine only). A strong policy costs nothing.
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  # The resource server defines the custom scope that M2M access tokens carry.
+  # Cognito formats the scope string as "<Identifier>/<ScopeName>"; with the
+  # defaults that is "a2a-saas-customer-callback/invoke".
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Ref ResourceServerId
+      Name: !Ref ResourceServerId
+      Scopes:
+        - ScopeName: !Ref ScopeName
+          ScopeDescription: Call the registered customer's context agent
+
+  # Hosted Cognito domain serving the OAuth /oauth2/token endpoint.
+  # The prefix includes the 12-digit account ID so it is unique in the Region and
+  # stable across redeploys. It contains no reserved word (aws, amazon, cognito).
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub '${NamePrefix}-${AWS::AccountId}'
+
+  # Confidential app client for the OAuth 2.0 client-credentials (M2M) grant, used
+  # only by the SaaS agent's callback. Its secret is never output: notebook 2 reads
+  # it from Cognito in memory and writes it to the runtime stack's secret.
+  # Access tokens last 15 minutes to shorten the replay window.
+  CallbackClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Ref ClientName
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [!Sub '${ResourceServerId}/${ScopeName}']
+      SupportedIdentityProviders: [COGNITO]
+      AccessTokenValidity: 15
+      TokenValidityUnits:
+        AccessToken: minutes
+      # CallbackURLs / LogoutURLs intentionally omitted: client_credentials is a
+      # back-channel grant with no browser redirect leg, so no callback/logout URL
+      # applies. SupportedIdentityProviders is pinned to COGNITO so the client's
+      # provider set is deterministic rather than relying on an implicit default.
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  Issuer:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+  DiscoveryURL:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration'
+  TokenEndpoint:
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+  CallbackClientId:
+    Value: !Ref CallbackClient
+  CallbackScope:
+    Value: !Sub '${ResourceServerId}/${ScopeName}'

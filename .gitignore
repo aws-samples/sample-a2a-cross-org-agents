@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+.env
+.env.*
+.DS_Store
+agentcore_deploy/
+.bedrock_agentcore/
+*.zip
+.agents/
+
+# Local working notes (not part of the published sample)
+CHANGES.md
+
+# Onboarding handoff files (public values, but deployment-specific)
+onboarding-request.json
+onboarding-response.json

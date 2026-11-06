@@ -1,0 +1,173 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  A2A Composable Demo - enterprise identity (stack a2a-enterprise-identity, notebook 1).
+  The enterprise user pool issues tokens only to the enterprise's own workloads:
+  the orchestrator's client for calling the compliance SaaS, and the client for the
+  user API. It also holds the orchestrator's empty credentials secret (written
+  in-process by notebook 1) and reserves the partner API, so its URL can be
+  registered with the SaaS provider before notebook 3 attaches the gate.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Side prefix for the enterprise account
+    Default: a2a-enterprise
+    AllowedValues: [a2a-enterprise]
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${NamePrefix}-pool'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      # The pool has no users (machine-to-machine only). A strong policy costs nothing.
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  # Hosted Cognito domain serving the OAuth /oauth2/token endpoint.
+  # The prefix includes the 12-digit account ID so it is unique in the Region and
+  # stable across redeploys. It contains no reserved word (aws, amazon, cognito).
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub '${NamePrefix}-${AWS::AccountId}'
+
+  # Resource servers define the custom scopes that M2M access tokens carry.
+  # Cognito formats each scope as "<Identifier>/<ScopeName>". The identifiers are
+  # literals (NamePrefix allows one value), so the full scope strings appear here.
+  #
+  # Scope a2a-enterprise-compliance-saas/invoke: call the compliance SaaS.
+  # The SaaS AgentCore runtime trusts this pool, client, and scope.
+  SaasAccessResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: a2a-enterprise-compliance-saas
+      Name: a2a-enterprise-compliance-saas
+      Scopes:
+        - ScopeName: invoke
+          ScopeDescription: Call the compliance SaaS agent
+
+  # Scope a2a-enterprise-orchestrator/ask: the user API in front of the orchestrator.
+  OrchestratorResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: a2a-enterprise-orchestrator
+      Name: a2a-enterprise-orchestrator
+      Scopes:
+        - ScopeName: ask
+          ScopeDescription: Submit and read orchestrator jobs
+
+  # Confidential app clients for the OAuth 2.0 client-credentials (M2M) grant.
+  # Their secrets are never output. Access tokens last 15 minutes to shorten the
+  # replay window. CallbackURLs and LogoutURLs are omitted: client_credentials is a
+  # back-channel grant with no browser redirect. SupportedIdentityProviders is
+  # pinned to COGNITO so the provider set is deterministic.
+  #
+  # The orchestrator's client for calling the compliance SaaS. Notebook 1 writes
+  # its credentials to OrchestratorSecret in-process.
+  OrchestratorSaasClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: SaasAccessResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${NamePrefix}-orchestrator-saas'
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: ['a2a-enterprise-compliance-saas/invoke']
+      SupportedIdentityProviders: [COGNITO]
+      AccessTokenValidity: 15
+      TokenValidityUnits:
+        AccessToken: minutes
+
+  # The caller of the user API (in the demo, notebook 3).
+  OrchestratorUserClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: OrchestratorResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${NamePrefix}-orchestrator-user'
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: ['a2a-enterprise-orchestrator/ask']
+      SupportedIdentityProviders: [COGNITO]
+      AccessTokenValidity: 15
+      TokenValidityUnits:
+        AccessToken: minutes
+
+  # -- Secrets Manager --
+  # Created EMPTY (no SecretString): notebook 1 writes the orchestrator client's
+  # credentials with put_secret_value, so a stack update can never overwrite a real
+  # value and no secret transits a template parameter or output. Only
+  # OrchestratorTaskRole (stack a2a-enterprise-infra) is granted read access, and
+  # that stack's OrchestratorSecretPolicy denies every other principal.
+  # trivy:ignore:AVD-AWS-0098 -- Secrets Manager AWS managed key; use a customer managed KMS key in production
+  OrchestratorSecret:
+    Type: AWS::SecretsManager::Secret
+    # checkov:skip=CKV_AWS_149:Demo uses the Secrets Manager AWS managed key. Use a customer managed KMS key in production (README, Security).
+    Properties:
+      Name: !Sub '${NamePrefix}/orchestrator-credentials'
+      Description: The orchestrator client's own credentials for calling the compliance SaaS (written by the notebook)
+
+  # -- Partner API (reserved) --
+  # Reserved here so its URL can be registered with the SaaS provider at onboarding.
+  # It has no stage, routes, or integration, so it serves nothing yet. Notebook 3's
+  # infra stack (a2a-enterprise-infra) attaches the saas-jwt gate, the routes, and
+  # the stage.
+  PartnerApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${NamePrefix}-context-api'
+      ProtocolType: HTTP
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  Issuer:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+    Export:
+      Name: !Sub '${AWS::StackName}-Issuer'
+  DiscoveryURL:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration'
+  TokenEndpoint:
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+  OrchestratorSaasClientId:
+    Value: !Ref OrchestratorSaasClient
+  OrchestratorSaasScope:
+    Description: Scope the orchestrator client requests to call the compliance SaaS
+    Value: a2a-enterprise-compliance-saas/invoke
+  OrchestratorUserClientId:
+    Value: !Ref OrchestratorUserClient
+    Export:
+      Name: !Sub '${AWS::StackName}-OrchestratorUserClientId'
+  OrchestratorUserScope:
+    Description: Scope the user API requires
+    Value: a2a-enterprise-orchestrator/ask
+    Export:
+      Name: !Sub '${AWS::StackName}-OrchestratorUserScope'
+  OrchestratorSecretArn:
+    Description: ARN only (no value)
+    Value: !Ref OrchestratorSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-OrchestratorSecretArn'
+  PartnerApiId:
+    Value: !Ref PartnerApi
+    Export:
+      Name: !Sub '${AWS::StackName}-PartnerApiId'
+  CallbackURL:
+    Description: Partner (callback) API URL registered with the SaaS provider, with a trailing slash
+    Value: !Sub '${PartnerApi.ApiEndpoint}/'
+    Export:
+      Name: !Sub '${AWS::StackName}-CallbackURL'

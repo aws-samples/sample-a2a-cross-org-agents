@@ -1,0 +1,894 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  A2A Composable Demo - enterprise infrastructure (stack a2a-enterprise-infra, no ECS services).
+  VPC with private subnets, internal NLB, the gate on the partner API reserved by the
+  identity stack (trusts only the SaaS provider's pool, callback client, and scope),
+  the user orchestrator API (trusts the enterprise pool), one VPC link, ECR, CodeBuild,
+  one task role per agent, and the resource policy that makes the orchestrator's
+  secret readable only by its task role.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Side prefix for the enterprise account
+    Default: a2a-enterprise
+    AllowedValues: [a2a-enterprise]
+  IdentityStackName:
+    Type: String
+    Description: Name of the enterprise identity stack (notebook 1)
+    Default: a2a-enterprise-identity
+  SourceBucketName:
+    Type: String
+    Description: S3 bucket containing source.zip
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  SaasIssuer:
+    Type: String
+    Description: The SaaS provider's pool issuer (from the onboarding response)
+    AllowedPattern: '^https://cognito-idp\.(us-east-1|us-east-2|us-west-2)\.amazonaws\.com/(us-east-1|us-east-2|us-west-2)_[0-9A-Za-z]+$'
+  SaasCallbackClientId:
+    Type: String
+    Description: ID of the SaaS provider's callback client, the only client the partner API accepts
+    AllowedPattern: '^[0-9a-zA-Z]{1,128}$'
+  SaasCallbackScope:
+    Type: String
+    Description: Scope the SaaS provider's callback must carry
+    AllowedPattern: '^[a-z0-9-]{1,64}/[a-z0-9-]{1,64}$'
+  SaasTokenEndpoint:
+    Type: String
+    Description: The SaaS provider's token endpoint, advertised in the context agent's Agent Card
+    AllowedPattern: '^https://[a-z0-9-]{1,63}\.auth\.(us-east-1|us-east-2|us-west-2)\.amazoncognito\.com/oauth2/token$'
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: >
+      First Availability Zone (public subnet, NAT gateway, private subnet 1). Notebook 3 picks
+      one that supports API Gateway VPC links and the Bedrock and Secrets Manager endpoints
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: >
+      Second Availability Zone (private subnet 2), with the same support as AvailabilityZone1
+
+Resources:
+
+  # -- Secrets Manager --
+  # The orchestrator's secret lives in the identity stack (written in-process by
+  # notebook 1). This policy makes "one reader" a property of the secret: it denies
+  # GetSecretValue to every principal except OrchestratorTaskRole. It lives here so
+  # it can name the role's exact ARN. It guards against accidental and over-broad
+  # identity policies; an account administrator can still remove it.
+  OrchestratorSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !ImportValue
+        Fn::Sub: '${IdentityStackName}-OrchestratorSecretArn'
+      BlockPublicPolicy: true
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: OnlyTheOrchestratorTaskRoleReads
+            Effect: Deny
+            Principal: '*'
+            Action: secretsmanager:GetSecretValue
+            Resource: '*'
+            Condition:
+              ArnNotEquals:
+                aws:PrincipalArn: !GetAtt OrchestratorTaskRole.Arn
+
+  # -- VPC --
+  # trivy:ignore:AVD-AWS-0178 -- VPC Flow Logs off to keep the short-lived demo minimal; enable in production
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  # Hosts only the NAT gateway (which has its own Elastic IP). Nothing launched here
+  # gets a public IP automatically; all workloads run in the private subnets.
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: false
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.3.0/24'
+      AvailabilityZone: !Ref AvailabilityZone1
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.4.0/24'
+      AvailabilityZone: !Ref AvailabilityZone2
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # -- Security groups --
+  # Chain: VPC link SG -> NLB SG -> task SGs. Every ingress rule names a source
+  # security group; no service port is open to a CIDR.
+  VpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API Gateway VPC link ENIs - no inbound; outbound only to the agents NLB
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 9001
+          ToPort: 9001
+          DestinationSecurityGroupId: !Ref AgentsNlbSecurityGroup
+          Description: VPC link to NLB context agent listener (9001)
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          DestinationSecurityGroupId: !Ref AgentsNlbSecurityGroup
+          Description: VPC link to NLB orchestrator listener (8000)
+  AgentsNlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal agents NLB - inbound only from the VPC link; outbound only to the agent tasks
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 9001
+          ToPort: 9001
+          DestinationSecurityGroupId: !Ref ContextAgentSecurityGroup
+          Description: NLB to context agent tasks and health checks (9001)
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          DestinationSecurityGroupId: !Ref OrchestratorSecurityGroup
+          Description: NLB to orchestrator tasks and health checks (8000)
+  AgentsNlbIngressContext:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AgentsNlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9001
+      ToPort: 9001
+      SourceSecurityGroupId: !Ref VpcLinkSecurityGroup
+      Description: VPC link to context agent listener (9001)
+  AgentsNlbIngressOrchestrator:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AgentsNlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !Ref VpcLinkSecurityGroup
+      Description: VPC link to orchestrator listener (8000)
+  # Task SGs allow outbound HTTPS only, in place of the default allow-all outbound rule.
+  # Everything the tasks call is on 443: Bedrock and Secrets Manager through the VPC
+  # endpoints; Cognito, the SaaS AgentCore endpoint, ECR, and CloudWatch Logs through the
+  # NAT gateway. Those public AWS endpoints have no fixed address range, so the
+  # destination is 0.0.0.0/0. Security groups don't filter DNS or the ECS task metadata
+  # endpoint. Production: VPC endpoints for more services, or an egress proxy or AWS
+  # Network Firewall that allows only the expected domains.
+  ContextAgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Context agent tasks - inbound 9001 only from the agents NLB
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        # trivy:ignore:AVD-AWS-0104 -- outbound only, HTTPS only; the destinations are public AWS endpoints (see above)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Outbound HTTPS only - Bedrock (VPC endpoint), ECR and CloudWatch Logs (NAT gateway)
+  ContextAgentIngressFromNlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ContextAgentSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9001
+      ToPort: 9001
+      SourceSecurityGroupId: !Ref AgentsNlbSecurityGroup
+      Description: Agents NLB to context agent (9001)
+  OrchestratorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Orchestrator tasks - inbound 8000 only from the agents NLB
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        # trivy:ignore:AVD-AWS-0104 -- outbound only, HTTPS only; the destinations are public AWS endpoints (see the task SG comment)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Outbound HTTPS only - Bedrock and Secrets Manager (VPC endpoints), Cognito, AgentCore, ECR, CloudWatch Logs (NAT)
+  OrchestratorIngressFromNlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref OrchestratorSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !Ref AgentsNlbSecurityGroup
+      Description: Agents NLB to orchestrator (8000)
+  # Interface endpoints never open connections, so this SG allows no outbound traffic. The one
+  # egress rule matches nothing (ICMP type 252 code 86 to 255.255.255.255/32); listing any rule
+  # removes the default allow-all outbound rule. The AWS CDK uses the same rule for
+  # allowAllOutbound: false.
+  VPCEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints - HTTPS only from the agent tasks
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: icmp
+          FromPort: 252
+          ToPort: 86
+          CidrIp: 255.255.255.255/32
+          Description: Matches no traffic - removes the default allow-all outbound rule
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ContextAgentSecurityGroup
+          Description: Context agent to AWS service endpoints (HTTPS)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref OrchestratorSecurityGroup
+          Description: Orchestrator to AWS service endpoints (HTTPS)
+
+  # -- VPC endpoints --
+  BedrockEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock-runtime'
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref VPCEndpointSG]
+      PrivateDnsEnabled: true
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref VPCEndpointSG]
+      PrivateDnsEnabled: true
+
+  # -- ECR --
+  # EmptyOnDelete removes the images when the stack is deleted.
+  # trivy:ignore:AVD-AWS-0033 -- AES-256 service-default encryption; use a customer managed KMS key in production
+  # trivy:ignore:AVD-AWS-0031 -- mutable tags: CodeBuild re-pushes :latest on each notebook run
+  ContextAgentRepo:
+    Type: AWS::ECR::Repository
+    # checkov:skip=CKV_AWS_136:Encrypted at rest with AES-256 (service default). Use a customer managed KMS key in production.
+    # checkov:skip=CKV_AWS_51:CodeBuild pushes :latest on every notebook run; immutable tags would fail re-runs. Scan on push is enabled.
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}-context-agent'
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  # trivy:ignore:AVD-AWS-0033 -- AES-256 service-default encryption; use a customer managed KMS key in production
+  # trivy:ignore:AVD-AWS-0031 -- mutable tags: CodeBuild re-pushes :latest on each notebook run
+  OrchestratorRepo:
+    Type: AWS::ECR::Repository
+    # checkov:skip=CKV_AWS_136:Encrypted at rest with AES-256 (service default). Use a customer managed KMS key in production.
+    # checkov:skip=CKV_AWS_51:CodeBuild pushes :latest on every notebook run; immutable tags would fail re-runs. Scan on push is enabled.
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}-orchestrator'
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # -- CodeBuild --
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ecr:GetAuthorizationToken does not support resource-level permissions (must be '*')
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:PutImage, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload]
+                Resource: [!GetAtt ContextAgentRepo.Arn, !GetAtt OrchestratorRepo.Arn]
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${SourceBucketName}/source.zip'
+              # CodeBuild creates the project's log group at runtime
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${NamePrefix}-build'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${NamePrefix}-build:*'
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${NamePrefix}-build'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: CONTEXT_REPO_URI
+            Value: !GetAtt ContextAgentRepo.RepositoryUri
+          - Name: ORCHESTRATOR_REPO_URI
+            Value: !GetAtt OrchestratorRepo.RepositoryUri
+      Source:
+        Type: S3
+        Location: !Sub '${SourceBucketName}/source.zip'
+      TimeoutInMinutes: 15
+
+  # -- ECS cluster --
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${NamePrefix}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # -- IAM roles --
+  # Shared execution role for both task definitions: it pulls only the two agent
+  # repositories and writes only the two agent log groups (an inline policy in
+  # place of the AWS managed AmazonECSTaskExecutionRolePolicy, which allows every
+  # repository and log group in the account).
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TaskExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ecr:GetAuthorizationToken does not support resource-level permissions (must be '*')
+              - Sid: EcrAuthToken
+                Effect: Allow
+                Action: [ecr:GetAuthorizationToken]
+                Resource: '*'
+              - Sid: EcrPullAgentImages
+                Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: [!GetAtt ContextAgentRepo.Arn, !GetAtt OrchestratorRepo.Arn]
+              - Sid: WriteAgentLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: [!GetAtt ContextAgentLogs.Arn, !GetAtt OrchestratorLogs.Arn]
+  # The model IDs below are "us." cross-Region inference profiles. The profile ARN is
+  # exact (this Region and account). Bedrock may route the request to another US
+  # Region, so each foundation-model ARN wildcards only the Region segment; the model
+  # ID is exact.
+  OrchestratorTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrchestratorPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BedrockInvokeClaude
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-sonnet-4-6'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6'
+              - Sid: ReadOrchestratorCredentials
+                Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !ImportValue
+                  Fn::Sub: '${IdentityStackName}-OrchestratorSecretArn'
+              # Needed with a guardrail on each model call, and for the agent's own ApplyGuardrail checks
+              - Sid: ApplyGuardrail
+                Effect: Allow
+                Action: [bedrock:ApplyGuardrail]
+                Resource: !GetAtt Guardrail.GuardrailArn
+  ContextAgentTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ContextAgentPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BedrockInvokeNovaLite
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-lite-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/amazon.nova-lite-v1:0'
+              # Needed with a guardrail on each model call, and for the agent's own ApplyGuardrail checks
+              - Sid: ApplyGuardrail
+                Effect: Allow
+                Action: [bedrock:ApplyGuardrail]
+                Resource: !GetAtt Guardrail.GuardrailArn
+
+  # -- CloudWatch Logs --
+  # trivy:ignore:AVD-AWS-0017 -- CloudWatch Logs default encryption; use a customer managed KMS key in production
+  ContextAgentLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Encrypted with the CloudWatch Logs default key. Use a customer managed KMS key in production.
+    Properties:
+      LogGroupName: !Sub '/ecs/${NamePrefix}-context-agent'
+      RetentionInDays: 7
+  # trivy:ignore:AVD-AWS-0017 -- CloudWatch Logs default encryption; use a customer managed KMS key in production
+  OrchestratorLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Encrypted with the CloudWatch Logs default key. Use a customer managed KMS key in production.
+    Properties:
+      LogGroupName: !Sub '/ecs/${NamePrefix}-orchestrator'
+      RetentionInDays: 7
+  # trivy:ignore:AVD-AWS-0017 -- CloudWatch Logs default encryption; use a customer managed KMS key in production
+  ContextApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Encrypted with the CloudWatch Logs default key. Use a customer managed KMS key in production.
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${NamePrefix}-context-api'
+      RetentionInDays: 7
+  # trivy:ignore:AVD-AWS-0017 -- CloudWatch Logs default encryption; use a customer managed KMS key in production
+  OrchestratorApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Encrypted with the CloudWatch Logs default key. Use a customer managed KMS key in production.
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${NamePrefix}-orchestrator-api'
+      RetentionInDays: 7
+
+  # -- Internal NLB (reached only through the API Gateway VPC link) --
+  AgentsNLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    # checkov:skip=CKV_AWS_91:Access logging is off to keep the short-lived demo minimal; both API Gateway stages have access logs. Enable NLB access logs in production.
+    Properties:
+      Name: !Sub '${NamePrefix}-agents-nlb'
+      Scheme: internal
+      Type: network
+      Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroups: [!Ref AgentsNlbSecurityGroup]
+      # Each service runs one task, in one of the two zones. With cross-zone load
+      # balancing, the NLB node in either zone can reach it; without it, a request the
+      # VPC link sends to the other zone's node fails, and API Gateway returns 503.
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: 'true'
+  # preserve_client_ip is off so targets see the NLB's address and the task SGs can
+  # reference the NLB SG deterministically.
+  ContextAgentTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 9001
+      Protocol: TCP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckProtocol: TCP
+      TargetGroupAttributes:
+        - Key: preserve_client_ip.enabled
+          Value: 'false'
+  ContextAgentListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AgentsNLB
+      Port: 9001
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ContextAgentTargetGroup
+  OrchestratorTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8000
+      Protocol: TCP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      HealthCheckTimeoutSeconds: 10
+      TargetGroupAttributes:
+        - Key: preserve_client_ip.enabled
+          Value: 'false'
+  OrchestratorListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AgentsNLB
+      Port: 8000
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OrchestratorTargetGroup
+
+  # -- API Gateway VPC link (shared by both HTTP APIs) --
+  AgentsVpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub '${NamePrefix}-vpclink'
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref VpcLinkSecurityGroup]
+
+  # -- Partner API: the SaaS provider's callback to the context agent --
+  # The API itself is reserved by the identity stack (notebook 1), whose URL the
+  # SaaS provider registered at onboarding. This stack attaches the gate: it trusts
+  # only the SaaS provider's pool, its callback client, and its callback scope
+  # (M2M tokens have no aud, so API Gateway checks client_id against Audience).
+  ContextApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !ImportValue
+        Fn::Sub: '${IdentityStackName}-PartnerApiId'
+      AuthorizerType: JWT
+      Name: saas-jwt
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience: [!Ref SaasCallbackClientId]
+        Issuer: !Ref SaasIssuer
+  ContextApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !ImportValue
+        Fn::Sub: '${IdentityStackName}-PartnerApiId'
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Ref ContextAgentListener
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref AgentsVpcLink
+      PayloadFormatVersion: '1.0'
+  ContextApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !ImportValue
+        Fn::Sub: '${IdentityStackName}-PartnerApiId'
+      RouteKey: 'POST /'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ContextApiAuthorizer
+      AuthorizationScopes: [!Ref SaasCallbackScope]
+      Target: !Sub 'integrations/${ContextApiIntegration}'
+  # Public by design: a static A2A discovery document with no model call.
+  ContextApiCardRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !ImportValue
+        Fn::Sub: '${IdentityStackName}-PartnerApiId'
+      RouteKey: 'GET /.well-known/agent-card.json'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${ContextApiIntegration}'
+  ContextApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: [ContextApiRoute, ContextApiCardRoute]
+    Properties:
+      ApiId: !ImportValue
+        Fn::Sub: '${IdentityStackName}-PartnerApiId'
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+      AccessLogSettings:
+        DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ContextApiAccessLogs}'
+        Format: '{"requestId":"$context.requestId","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","path":"$context.path","status":"$context.status","clientId":"$context.authorizer.claims.client_id","authorizerError":"$context.authorizer.error","integrationStatus":"$context.integrationStatus","integrationError":"$context.integrationErrorMessage","responseLatency":"$context.responseLatency","responseLength":"$context.responseLength"}'
+
+  # -- User API: the front door to the orchestrator --
+  # Trusts the enterprise pool and its user client (both from the identity stack,
+  # notebook 1). In the demo, notebook 3 is the caller.
+  OrchestratorApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${NamePrefix}-orchestrator-api'
+      ProtocolType: HTTP
+  OrchestratorApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref OrchestratorApi
+      AuthorizerType: JWT
+      Name: user-jwt
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - Fn::ImportValue: !Sub '${IdentityStackName}-OrchestratorUserClientId'
+        Issuer: !ImportValue
+          Fn::Sub: '${IdentityStackName}-Issuer'
+  # Caller binding: API Gateway overwrites x-a2a-caller-client-id with the
+  # client_id claim of the validated token, so a client can't spoof it. The
+  # orchestrator records it on each job and returns 404 for another caller's job.
+  OrchestratorApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref OrchestratorApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Ref OrchestratorListener
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref AgentsVpcLink
+      PayloadFormatVersion: '1.0'
+      RequestParameters:
+        'overwrite:header.x-a2a-caller-client-id': '$context.authorizer.claims.client_id'
+  OrchestratorSubmitJobRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OrchestratorApi
+      RouteKey: 'POST /jobs'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref OrchestratorApiAuthorizer
+      AuthorizationScopes:
+        - Fn::ImportValue: !Sub '${IdentityStackName}-OrchestratorUserScope'
+      Target: !Sub 'integrations/${OrchestratorApiIntegration}'
+  OrchestratorGetJobRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OrchestratorApi
+      RouteKey: 'GET /jobs/{job_id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref OrchestratorApiAuthorizer
+      AuthorizationScopes:
+        - Fn::ImportValue: !Sub '${IdentityStackName}-OrchestratorUserScope'
+      Target: !Sub 'integrations/${OrchestratorApiIntegration}'
+  OrchestratorHealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OrchestratorApi
+      RouteKey: 'GET /health'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref OrchestratorApiAuthorizer
+      AuthorizationScopes:
+        - Fn::ImportValue: !Sub '${IdentityStackName}-OrchestratorUserScope'
+      Target: !Sub 'integrations/${OrchestratorApiIntegration}'
+  OrchestratorAgentsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OrchestratorApi
+      RouteKey: 'GET /agents'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref OrchestratorApiAuthorizer
+      AuthorizationScopes:
+        - Fn::ImportValue: !Sub '${IdentityStackName}-OrchestratorUserScope'
+      Target: !Sub 'integrations/${OrchestratorApiIntegration}'
+  OrchestratorApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: [OrchestratorSubmitJobRoute, OrchestratorGetJobRoute, OrchestratorHealthRoute, OrchestratorAgentsRoute]
+    Properties:
+      ApiId: !Ref OrchestratorApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+      AccessLogSettings:
+        DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${OrchestratorApiAccessLogs}'
+        Format: '{"requestId":"$context.requestId","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","path":"$context.path","status":"$context.status","clientId":"$context.authorizer.claims.client_id","authorizerError":"$context.authorizer.error","integrationStatus":"$context.integrationStatus","integrationError":"$context.integrationErrorMessage","responseLatency":"$context.responseLatency","responseLength":"$context.responseLength"}'
+
+  # -- Amazon Bedrock Guardrails --
+  # Prompt-attack and harmful-content filters only. No sensitive-information, word, topic, or grounding
+  # policy: a sensitive-information filter could mask the escalation contacts the agents pass on. Classic tier and the AWS
+  # managed key; README, Production considerations, has the Standard tier and a customer managed key.
+  Guardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub '${NamePrefix}-guardrail'
+      Description: Prompt-attack and harmful-content filters for the A2A demo agents; no sensitive-information filters
+      BlockedInputMessaging: "This request was blocked by the enterprise's Amazon Bedrock guardrail."
+      BlockedOutputsMessaging: "This response was blocked by the enterprise's Amazon Bedrock guardrail."
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: PROMPT_ATTACK
+            InputStrength: HIGH
+            OutputStrength: NONE
+          - Type: HATE
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: INSULTS
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: SEXUAL
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: VIOLENCE
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: MISCONDUCT
+            InputStrength: LOW
+            OutputStrength: LOW
+  # A numbered version for the agents (never DRAFT). A Description change forces a new version.
+  GuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt Guardrail.GuardrailId
+      Description: 'Prompt attack HIGH on input; hate, insults, sexual, violence MEDIUM; misconduct LOW'
+
+Outputs:
+  VPCId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+  ContextAgentSecurityGroupId:
+    Value: !Ref ContextAgentSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ContextAgentSecurityGroupId'
+  OrchestratorSecurityGroupId:
+    Value: !Ref OrchestratorSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-OrchestratorSecurityGroupId'
+  AgentsNlbSecurityGroupId:
+    Value: !Ref AgentsNlbSecurityGroup
+  VpcLinkSecurityGroupId:
+    Value: !Ref VpcLinkSecurityGroup
+  ECSClusterName:
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterName'
+  ExecutionRoleArn:
+    Value: !GetAtt ExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
+  OrchestratorTaskRoleArn:
+    Value: !GetAtt OrchestratorTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrchestratorTaskRoleArn'
+  ContextAgentTaskRoleArn:
+    Value: !GetAtt ContextAgentTaskRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ContextAgentTaskRoleArn'
+  ContextAgentRepoUri:
+    Value: !GetAtt ContextAgentRepo.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-ContextAgentRepoUri'
+  OrchestratorRepoUri:
+    Value: !GetAtt OrchestratorRepo.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-OrchestratorRepoUri'
+  ContextAgentTargetGroupArn:
+    Value: !Ref ContextAgentTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ContextAgentTargetGroupArn'
+  OrchestratorTargetGroupArn:
+    Value: !Ref OrchestratorTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-OrchestratorTargetGroupArn'
+  OrchestratorApiURL:
+    Description: User API base URL, without a trailing slash
+    Value: !Sub 'https://${OrchestratorApi}.execute-api.${AWS::Region}.amazonaws.com'
+  CallerClientIdHeader:
+    Description: Request header API Gateway overwrites with the caller's client_id claim
+    Value: x-a2a-caller-client-id
+  SaasIssuer:
+    Description: Issuer the partner API's saas-jwt authorizer trusts
+    Value: !Ref SaasIssuer
+  SaasCallbackClientId:
+    Description: The only client the partner API's saas-jwt authorizer accepts
+    Value: !Ref SaasCallbackClientId
+  SaasTokenEndpoint:
+    Description: The SaaS provider's token endpoint, advertised in the context agent's Agent Card
+    Value: !Ref SaasTokenEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-SaasTokenEndpoint'
+  SaasCallbackScope:
+    Description: Scope the partner API's POST / route requires
+    Value: !Ref SaasCallbackScope
+    Export:
+      Name: !Sub '${AWS::StackName}-SaasCallbackScope'
+  CodeBuildProject:
+    Value: !Ref CodeBuildProject
+  ContextAgentLogsGroup:
+    Value: !Ref ContextAgentLogs
+    Export:
+      Name: !Sub '${AWS::StackName}-ContextAgentLogsGroup'
+  OrchestratorLogsGroup:
+    Value: !Ref OrchestratorLogs
+    Export:
+      Name: !Sub '${AWS::StackName}-OrchestratorLogsGroup'
+  ContextApiAccessLogsGroup:
+    Value: !Ref ContextApiAccessLogs
+  OrchestratorApiAccessLogsGroup:
+    Value: !Ref OrchestratorApiAccessLogs
+  GuardrailId:
+    Description: The agents' Amazon Bedrock guardrail ID (GUARDRAIL_ID in the services stack)
+    Value: !GetAtt Guardrail.GuardrailId
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardrailId'
+  GuardrailVersion:
+    Description: The guardrail's numbered version (GUARDRAIL_VERSION in the services stack)
+    Value: !GetAtt GuardrailVersion.Version
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardrailVersion'
+  GuardrailArn:
+    Description: The guardrail's ARN without a version, the scope of each task role's bedrock:ApplyGuardrail
+    Value: !GetAtt Guardrail.GuardrailArn
